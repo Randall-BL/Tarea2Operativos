@@ -12,7 +12,7 @@ rm -rf build
 mkdir build
 
 echo "[1/3] Compilando bootloader..."
-nasm -f bin src/boot.asm -o build/boot.bin
+nasm -f bin boot.asm -o build/boot.bin
 
 # Verificar que el bootloader sea exactamente 512 bytes
 BOOT_SIZE=$(wc -c < build/boot.bin)
@@ -23,7 +23,7 @@ fi
 echo "      boot.bin = $BOOT_SIZE bytes (OK)"
 
 echo "[2/3] Compilando juego..."
-nasm -f bin src/juego.asm -o build/juego.bin
+nasm -f bin juego.asm -o build/juego.bin
 
 GAME_SIZE=$(wc -c < build/juego.bin)
 GAME_SECTS=$(( (GAME_SIZE + 511) / 512 ))  # redondear hacia arriba
@@ -44,7 +44,7 @@ TOTAL=$(wc -c < build/game.bin)
 echo "      game.bin = $TOTAL bytes total"
 echo ""
 echo "Listo! Para ejecutar:"
-echo "  qemu-system-x86_64 -fda build/game.bin"
+echo "  qemu-system-x86_64 -fda build/game.bin -display sdl"
 echo ""
 echo "Ejecutando en QEMU..."
 qemu-system-x86_64 -fda build/game.bin

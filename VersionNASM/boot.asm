@@ -47,9 +47,16 @@ start:
 
     jc   .error             ; carry flag = error
 
-    ; Saltar al juego
-    mov  si, msg_ok
+    ; Mostrar mensaje de bienvenida
+    mov  si, msg_welcome
     call print_str
+
+    ; Esperar que el usuario presione Enter
+.wait_enter:
+    mov  ah, 0x00
+    int  0x16               ; leer tecla
+    cmp  al, 0x0D           ; 0x0D = Enter
+    jne  .wait_enter
 
     jmp  GAME_SEG:GAME_OFF  ; far jump al juego
 
@@ -81,8 +88,8 @@ print_str:
 ; ---- Datos ----
 boot_drive  db 0
 msg_loading db "Cargando...", 13, 10, 0
-msg_ok      db "OK! Iniciando juego", 13, 10, 0
 msg_error   db "ERROR al leer disco", 13, 10, 0
+msg_welcome db "Bienvenido, da Enter para iniciar.", 13, 10, 0
 
 ; ---- Padding hasta 510 bytes + firma 0xAA55 ----
 times 510 - ($ - $$) db 0
