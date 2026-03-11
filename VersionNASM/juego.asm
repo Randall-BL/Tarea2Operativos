@@ -54,6 +54,11 @@ seed       dw 0x5678
 drw_x      dw 0
 drw_y      dw 0
 drw_col    db 0
+pi_tick    dw 0
+str_x      dw 0
+str_y      dw 0
+str_fb     db 0
+px_tmp     dw 0
 
 ; ---- Fuente 8x8 ASCII 32-90 --------------------------------
 font:
@@ -123,8 +128,8 @@ db 0x7E,0x06,0x0C,0x18,0x30,0x60,0x7E,0x00  ; 90 Z
 setup:
     cli
     xor  ax, ax
-    mov  ds, ax
-    mov  es, ax
+    mov  ds, ax          ; DS = 0x0000 (datos en 0000:8000+)
+    mov  es, ax          ; ES = 0x0000 por defecto
     mov  ss, ax
     mov  sp, 0x7C00
     sti
@@ -137,6 +142,26 @@ setup:
     mov  ah, 0x00
     int  0x1A
     mov  [seed], dx
+
+    ; --- TEST: dibujar pixels de colores en esquinas ---
+    ; Si ves 4 puntos de colores, pix() funciona
+    mov  cx, 10          ; x=10
+    mov  di, 10          ; y=10
+    mov  ah, 15          ; blanco
+    call pix
+    mov  cx, 300
+    mov  di, 10
+    mov  ah, 12          ; rojo
+    call pix
+    mov  cx, 10
+    mov  di, 180
+    mov  ah, 10          ; verde
+    call pix
+    mov  cx, 300
+    mov  di, 180
+    mov  ah, 14          ; amarillo
+    call pix
+    ; --- FIN TEST ---
 
     call pantalla_inicio
     call random_pos
@@ -203,22 +228,42 @@ pantalla_inicio:
     mov  al, COL_T2
     call draw_str
 
-.wait:
+    ; Leer tick inicial
     mov  ah, 0x00
-    int  0x16
-    cmp  ah, 0x1C           ; ENTER
-    je   .ok
-    cmp  ah, 0x01           ; ESC
-    je   .salir
-    jmp  .wait
-.ok:
+    int  0x1A
+    mov  [pi_tick], dx      ; guardar tick inicial
+
+pi_wait:
+    ; Leer timer
+    mov  ah, 0x00
+    int  0x1A               ; DX = ticks actuales
+    mov  ax, dx
+    sub  ax, [pi_tick]      ; ax = ticks transcurridos
+    cmp  ax, 182            ; 182 ticks ~ 10 segundos
+    jae  pi_ok              ; tiempo agotado, empezar
+
+    ; Intentar leer tecla sin bloquear (puerto directo)
+    in   al, 0x64           ; leer status del controlador de teclado
+    test al, 0x01           ; bit 0 = hay dato disponible?
+    jz   pi_wait            ; no hay tecla
+
+    in   al, 0x60           ; leer scan code
+    cmp  al, 0x81           ; ESC release (0x01 | 0x80)
+    je   pi_sal
+    cmp  al, 0x01           ; ESC press
+    je   pi_sal
+    test al, 0x80           ; ignorar key-release (bit 7 = release)
+    jnz  pi_wait
+    ; es un key-press de cualquier tecla -> empezar
+
+pi_ok:
     ret
-.salir:
+pi_sal:
     call modo_texto
     cli
-.halt:
+pi_halt:
     hlt
-    jmp  .halt
+    jmp  pi_halt
 
 ; ============================================================
 ; HUD
@@ -340,95 +385,102 @@ read_font_row:
 ; ============================================================
 ; DRAW_STR - texto horizontal normal
 ; SI=cadena  CX=x  DX=y  AL=color
+; Todo en variables de memoria para evitar conflictos
 ; ============================================================
+ds_xbase   dw 0   ; x del caracter actual
+ds_ybase   dw 0   ; y base (fija)
+ds_fila    db 0   ; fila actual (0..7)
+ds_col     db 0   ; columna actual (0..7)
+ds_byte    db 0   ; byte de fuente de la fila actual
+
 draw_str:
-    push ax
-    push bx
-    push cx
-    push dx
     push si
-    push di
+    push ax
 
-    mov  [drw_col], al
-    mov  di, dx
+    mov  [ds_xbase], cx
+    mov  [ds_ybase], dx
+    mov  [drw_col],  al
 
-.char:
+ds_nextchar:
     mov  al, [si]
     or   al, al
-    jz   .fin
+    jz   ds_done
+    inc  si
     xor  ah, ah
     sub  ax, 32
-    jb   .next
+    jb   ds_nextchar
     cmp  ax, 58
-    ja   .next
+    ja   ds_nextchar
 
-    push cx
-    push di
+    ; bx = font + char*8
     push si
-    push ax
-
-    ; bx = &font[char * 8]
     mov  bx, ax
     shl  bx, 3
-    add  bx, font
+    add  bx, font            ; bx = base del char en fuente
 
-    mov  dh, 0              ; fila
-.fila:
-    cmp  dh, 8
-    je   .char_done
+    mov  byte [ds_fila], 0
+ds_rowloop:
+    cmp  byte [ds_fila], 8
+    je   ds_rowdone
 
-    call read_font_row
-    mov  dl, al             ; byte de la fila
-
-    mov  ch, 0x80           ; mascara bit
-    mov  cl, 0              ; columna
-.col:
-    cmp  cl, 8
-    je   .col_done
-    test dl, ch
-    jz   .nopix
-    push ax
+    ; leer byte de fuente para esta fila
+    xor  ax, ax
+    mov  al, [ds_fila]
+    add  ax, bx
     push bx
-    push cx
-    push dx
-    push di
+    mov  bx, ax
+    mov  al, [bx]
+    pop  bx
+    mov  [ds_byte], al
+
+    mov  byte [ds_col], 0
+ds_colloop:
+    cmp  byte [ds_col], 8
+    je   ds_coldone
+
+    ; bit = (ds_byte >> (7 - col)) & 1
+    mov  al, [ds_byte]
+    mov  cl, 7
+    sub  cl, [ds_col]        ; cl = 7 - col
+    shr  al, cl
+    and  al, 1
+    jz   ds_skipbit
+
+    ; pix(x = ds_xbase + ds_col,  y = ds_ybase + ds_fila, color)
+    xor  ax, ax
+    mov  al, [ds_col]
+    mov  cx, [ds_xbase]
+    add  cx, ax              ; cx = x
+
+    xor  ax, ax
+    mov  al, [ds_fila]
+    mov  di, [ds_ybase]
+    add  di, ax              ; di = y
+
     mov  ah, [drw_col]
+    push bx
+    push si
     call pix
-    pop  di
-    pop  dx
-    pop  cx
+    pop  si
     pop  bx
-    pop  ax
-.nopix:
-    shr  ch, 1
-    inc  cx
-    jmp  .col
 
-.col_done:
-    inc  dh
-    inc  di
-    jmp  .fila
+ds_skipbit:
+    inc  byte [ds_col]
+    jmp  ds_colloop
 
-.char_done:
+ds_coldone:
+    inc  byte [ds_fila]
+    jmp  ds_rowloop
+
+ds_rowdone:
+    pop  si
+    add  word [ds_xbase], 9  ; siguiente caracter
+    jmp  ds_nextchar
+
+ds_done:
     pop  ax
     pop  si
-    pop  di
-    pop  cx
-    add  cx, 9
-
-.next:
-    inc  si
-    jmp  .char
-
-.fin:
-    pop  di
-    pop  si
-    pop  dx
-    pop  cx
-    pop  bx
-    pop  ax
     ret
-
 ; ============================================================
 ; DRAW_R90L - 90 grados izquierda
 ; pixel[f][c] -> pantalla( drw_x+c , drw_y-f )
@@ -761,6 +813,8 @@ draw_r180:
 ; ============================================================
 ; PIX - escribir pixel en VGA modo 13h
 ; CX=x  DI=y  AH=color
+; Usa shift en vez de mul para no destruir DX
+; offset = y*320 = y*256 + y*64 = (y<<8) + (y<<6)
 ; ============================================================
 pix:
     push ax
@@ -771,21 +825,29 @@ pix:
     push es
 
     cmp  cx, SCR_W
-    jae  .out
+    jae  pix_out
     cmp  di, SCR_H
-    jae  .out
+    jae  pix_out
 
-    mov  bx, VGA_SEG
-    mov  es, bx
-    mov  ax, di
-    mov  bx, SCR_W
-    mul  bx
-    add  ax, cx
-    mov  di, ax
-    mov  al, ah
-    stosb
+    mov  al, ah          ; AL = color (guardarlo antes de tocar AX)
+    push ax              ; salvar AL en stack (como byte en AX)
 
-.out:
+    ; calcular offset = y*320 = y*256 + y*64
+    mov  ax, di          ; ax = y
+    mov  bx, ax          ; bx = y
+    shl  ax, 8           ; ax = y * 256
+    shl  bx, 6           ; bx = y * 64
+    add  ax, bx          ; ax = y * 320
+    add  ax, cx          ; ax = y*320 + x
+    mov  di, ax          ; di = offset
+
+    mov  ax, 0xA000
+    mov  es, ax
+
+    pop  ax              ; recuperar color en AL
+    mov  [es:di], al
+
+pix_out:
     pop  es
     pop  di
     pop  dx
@@ -822,46 +884,54 @@ borde:
     push cx
     push di
 
-    mov  di, 5
-    mov  cx, 5
-.top:
-    cmp  cx, 314
-    jg   .bot
+    ; linea superior  y=2, x=2..317
+    mov  di, 2
+    mov  cx, 2
+brd_top:
+    cmp  cx, 317
+    jg   brd_bot
     mov  ah, COL_BRD
     call pix
     inc  cx
-    jmp  .top
-.bot:
-    mov  di, 186
-    mov  cx, 5
-.bot2:
-    cmp  cx, 314
-    jg   .left
+    jmp  brd_top
+
+    ; linea inferior  y=197, x=2..317
+brd_bot:
+    mov  di, 197
+    mov  cx, 2
+brd_bot2:
+    cmp  cx, 317
+    jg   brd_left
     mov  ah, COL_BRD
     call pix
     inc  cx
-    jmp  .bot2
-.left:
-    mov  cx, 5
-    mov  di, 5
-.left2:
-    cmp  di, 186
-    jg   .right
+    jmp  brd_bot2
+
+    ; linea izquierda  x=2, y=2..197
+brd_left:
+    mov  cx, 2
+    mov  di, 2
+brd_left2:
+    cmp  di, 197
+    jg   brd_right
     mov  ah, COL_BRD
     call pix
     inc  di
-    jmp  .left2
-.right:
-    mov  cx, 314
-    mov  di, 5
-.right2:
-    cmp  di, 186
-    jg   .done
+    jmp  brd_left2
+
+    ; linea derecha  x=317, y=2..197
+brd_right:
+    mov  cx, 317
+    mov  di, 2
+brd_right2:
+    cmp  di, 197
+    jg   brd_done
     mov  ah, COL_BRD
     call pix
     inc  di
-    jmp  .right2
-.done:
+    jmp  brd_right2
+
+brd_done:
     pop  di
     pop  cx
     pop  ax
