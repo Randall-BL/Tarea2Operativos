@@ -261,6 +261,35 @@ static void draw_scene(const Framebuffer *fb, const GameState *state) {
     }
 }
 
+static UINT32 make_seed(EFI_SYSTEM_TABLE *SystemTable, const Framebuffer *fb) {
+    UINT32 seed = 0xA5A5A5A5u ^ fb->width ^ (fb->height << 16);
+    EFI_TIME now;
+    EFI_STATUS status;
+
+    status = uefi_call_wrapper(SystemTable->RuntimeServices->GetTime, 2, &now, NULL);
+    if (!EFI_ERROR(status)) {
+        seed ^= now.Nanosecond;
+        seed ^= ((UINT32)now.Second << 24);
+        seed ^= ((UINT32)now.Minute << 16);
+        seed ^= ((UINT32)now.Hour << 8);
+        seed ^= ((UINT32)now.Day << 20);
+        seed ^= ((UINT32)now.Month << 12);
+        seed ^= (UINT32)now.Year;
+    }
+
+    seed ^= (UINT32)(UINTN)fb->fb;
+
+    seed ^= (seed << 13);
+    seed ^= (seed >> 17);
+    seed ^= (seed << 5);
+
+    if (seed == 0) {
+        seed = 1;
+    }
+
+    return seed;
+}
+
 EFI_STATUS game_run(EFI_SYSTEM_TABLE *SystemTable) {
     EFI_STATUS status;
     EFI_INPUT_KEY key;
@@ -289,7 +318,7 @@ EFI_STATUS game_run(EFI_SYSTEM_TABLE *SystemTable) {
     fb_init(&fb, gop);
 
     state.rotation = ROT_NORMAL;
-    state.seed = 0xA5A5A5A5u ^ fb.width ^ (fb.height << 16);
+    state.seed = make_seed(SystemTable, &fb);
     randomize_position(&state, &fb);
 
     while (1) {
@@ -306,19 +335,16 @@ EFI_STATUS game_run(EFI_SYSTEM_TABLE *SystemTable) {
 
         if (key.ScanCode == SCAN_LEFT) {
             state.rotation = (UINT8)((state.rotation + 3u) & 3u);
-            randomize_position(&state, &fb);
             continue;
         }
 
         if (key.ScanCode == SCAN_RIGHT) {
             state.rotation = (UINT8)((state.rotation + 1u) & 3u);
-            randomize_position(&state, &fb);
             continue;
         }
 
         if (key.ScanCode == SCAN_UP || key.ScanCode == SCAN_DOWN) {
             state.rotation = (UINT8)(state.rotation ^ 2u);
-            randomize_position(&state, &fb);
             continue;
         }
 
