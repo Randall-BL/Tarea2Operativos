@@ -11,8 +11,9 @@
 
 GAME_SEG   EQU 0x0000
 GAME_OFF   EQU 0x8000       ; cargamos el juego en 0000:8000
-GAME_SECTS EQU 20           ; sectores a leer (20 * 512 = 10240 bytes)
-                             ; ajustar si el juego crece
+%ifndef GAME_SECTS
+GAME_SECTS EQU 20           ; valor por defecto (se puede sobreescribir con -D GAME_SECTS=n)
+%endif
 
 start:
     cli
@@ -21,6 +22,7 @@ start:
     mov  es, ax
     mov  ss, ax
     mov  sp, 0x7C00
+    mov  esp, 0x00007C00
     sti
 
     ; Guardar drive (BIOS lo pone en DL al arrancar)
@@ -47,17 +49,9 @@ start:
 
     jc   .error             ; carry flag = error
 
-    ; Mostrar mensaje de bienvenida
+    ; Mostrar mensaje y saltar al juego
     mov  si, msg_welcome
     call print_str
-
-    ; Esperar que el usuario presione Enter
-.wait_enter:
-    mov  ah, 0x00
-    int  0x16               ; leer tecla
-    cmp  al, 0x0D           ; 0x0D = Enter
-    jne  .wait_enter
-
     jmp  GAME_SEG:GAME_OFF  ; far jump al juego
 
 .error:
@@ -89,7 +83,7 @@ print_str:
 boot_drive  db 0
 msg_loading db "Cargando...", 13, 10, 0
 msg_error   db "ERROR al leer disco", 13, 10, 0
-msg_welcome db "Bienvenido, da Enter para iniciar.", 13, 10, 0
+msg_welcome db "Juego cargado. Iniciando...", 13, 10, 0
 
 ; ---- Padding hasta 510 bytes + firma 0xAA55 ----
 times 510 - ($ - $$) db 0
