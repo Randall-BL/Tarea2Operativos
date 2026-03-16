@@ -11,6 +11,15 @@
 #define SCALE 4
 #define CHAR_SIZE (8 * SCALE)
 #define CHAR_ADV  (9 * SCALE)
+#define MOVE_SPEED 4
+#define FRAME_US 16000
+#define HOLD_TIMEOUT_FRAMES 14
+
+#define MOVE_KEY_NONE  0
+#define MOVE_KEY_UP    1
+#define MOVE_KEY_DOWN  2
+#define MOVE_KEY_LEFT  3
+#define MOVE_KEY_RIGHT 4
 
 typedef struct {
     UINT32 width;
@@ -64,6 +73,11 @@ static UINTN str_len8(const CHAR8 *s) {
     return len;
 }
 
+static BOOLEAN poll_key(EFI_SYSTEM_TABLE *st, EFI_INPUT_KEY *key) {
+    EFI_STATUS status = uefi_call_wrapper(st->ConIn->ReadKeyStroke, 2, st->ConIn, key);
+    return (BOOLEAN)(!EFI_ERROR(status));
+}
+
 static EFI_STATUS wait_key(EFI_SYSTEM_TABLE *st, EFI_INPUT_KEY *key) {
     EFI_STATUS status;
     UINTN index;
@@ -95,6 +109,10 @@ static EFI_STATUS confirm_start(EFI_SYSTEM_TABLE *SystemTable) {
     Print(L"  Flecha Der  : Rotar 90 a la derecha\r\n");
     Print(L"  Flecha Arr  : Rotar 180\r\n");
     Print(L"  Flecha Abj  : Rotar 180\r\n");
+    Print(L"  W           : Mover arriba\r\n");
+    Print(L"  S           : Mover abajo\r\n");
+    Print(L"  A           : Mover izquierda\r\n");
+    Print(L"  D           : Mover derecha\r\n");
     Print(L"  R           : Reiniciar posicion random\r\n");
     Print(L"  ESC         : Salir del juego\r\n\r\n");
     Print(L"Presiona ENTER para comenzar o ESC para cancelar...\r\n");
@@ -244,6 +262,49 @@ static void randomize_position(GameState *state, const Framebuffer *fb) {
     state->y = (INT32)(lcg_next(&state->seed) % (UINT32)(max_y + 1));
 }
 
+static void move_with_bounce(GameState *state, const Framebuffer *fb, INT32 *vx, INT32 *vy) {
+    INT32 obj_w;
+    INT32 obj_h;
+    INT32 max_x;
+    INT32 max_y;
+    INT32 nx;
+    INT32 ny;
+
+    calc_bounds(state->rotation, str_len8(NAME1), str_len8(NAME2), &obj_w, &obj_h);
+
+    max_x = (INT32)fb->width - obj_w;
+    max_y = (INT32)fb->height - obj_h;
+
+    if (max_x < 0) {
+        max_x = 0;
+    }
+    if (max_y < 0) {
+        max_y = 0;
+    }
+
+    nx = state->x + *vx;
+    ny = state->y + *vy;
+
+    if (nx < 0) {
+        nx = 0;
+        *vx = (*vx < 0) ? -*vx : *vx;
+    } else if (nx > max_x) {
+        nx = max_x;
+        *vx = (*vx > 0) ? -*vx : *vx;
+    }
+
+    if (ny < 0) {
+        ny = 0;
+        *vy = (*vy < 0) ? -*vy : *vy;
+    } else if (ny > max_y) {
+        ny = max_y;
+        *vy = (*vy > 0) ? -*vy : *vy;
+    }
+
+    state->x = nx;
+    state->y = ny;
+}
+
 static void draw_scene(const Framebuffer *fb, const GameState *state) {
     const UINT32 black = 0x00000000;
     const UINT32 yellow = 0x0000FFFF;
@@ -297,6 +358,11 @@ EFI_STATUS game_run(EFI_SYSTEM_TABLE *SystemTable) {
     EFI_GUID gop_guid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
     Framebuffer fb;
     GameState state;
+    UINT32 frame = 0;
+    UINT32 last_move_input_frame = 0;
+    UINT8 active_move_key = MOVE_KEY_NONE;
+    INT32 vx = 0;
+    INT32 vy = 0;
 
     status = confirm_start(SystemTable);
     if (status == EFI_ABORTED) {
@@ -322,36 +388,91 @@ EFI_STATUS game_run(EFI_SYSTEM_TABLE *SystemTable) {
     randomize_position(&state, &fb);
 
     while (1) {
+        ++frame;
+
+        while (poll_key(SystemTable, &key)) {
+            if (key.ScanCode == SCAN_ESC || key.UnicodeChar == 27) {
+                return EFI_SUCCESS;
+            }
+
+            if (key.ScanCode == SCAN_LEFT) {
+                state.rotation = (UINT8)((state.rotation + 3u) & 3u);
+                continue;
+            }
+
+            if (key.ScanCode == SCAN_RIGHT) {
+                state.rotation = (UINT8)((state.rotation + 1u) & 3u);
+                continue;
+            }
+
+            if (key.ScanCode == SCAN_UP || key.ScanCode == SCAN_DOWN) {
+                state.rotation = (UINT8)(state.rotation ^ 2u);
+                continue;
+            }
+
+            if (key.UnicodeChar == 'r' || key.UnicodeChar == 'R') {
+                state.rotation = ROT_NORMAL;
+                state.seed = make_seed(SystemTable, &fb);
+                randomize_position(&state, &fb);
+                continue;
+            }
+
+            if (key.UnicodeChar == 'w' || key.UnicodeChar == 'W') {
+                if (!(active_move_key == MOVE_KEY_UP && (frame - last_move_input_frame) <= HOLD_TIMEOUT_FRAMES)) {
+                    active_move_key = MOVE_KEY_UP;
+                    vx = 0;
+                    vy = -MOVE_SPEED;
+                }
+                last_move_input_frame = frame;
+                continue;
+            }
+
+            if (key.UnicodeChar == 's' || key.UnicodeChar == 'S') {
+                if (!(active_move_key == MOVE_KEY_DOWN && (frame - last_move_input_frame) <= HOLD_TIMEOUT_FRAMES)) {
+                    active_move_key = MOVE_KEY_DOWN;
+                    vx = 0;
+                    vy = MOVE_SPEED;
+                }
+                last_move_input_frame = frame;
+                continue;
+            }
+
+            if (key.UnicodeChar == 'a' || key.UnicodeChar == 'A') {
+                if (!(active_move_key == MOVE_KEY_LEFT && (frame - last_move_input_frame) <= HOLD_TIMEOUT_FRAMES)) {
+                    active_move_key = MOVE_KEY_LEFT;
+                    vx = -MOVE_SPEED;
+                    vy = 0;
+                }
+                last_move_input_frame = frame;
+                continue;
+            }
+
+            if (key.UnicodeChar == 'd' || key.UnicodeChar == 'D') {
+                if (!(active_move_key == MOVE_KEY_RIGHT && (frame - last_move_input_frame) <= HOLD_TIMEOUT_FRAMES)) {
+                    active_move_key = MOVE_KEY_RIGHT;
+                    vx = MOVE_SPEED;
+                    vy = 0;
+                }
+                last_move_input_frame = frame;
+                continue;
+            }
+        }
+
+        if (active_move_key != MOVE_KEY_NONE) {
+            if ((frame - last_move_input_frame) > HOLD_TIMEOUT_FRAMES) {
+                active_move_key = MOVE_KEY_NONE;
+                vx = 0;
+                vy = 0;
+            } else {
+                move_with_bounce(&state, &fb, &vx, &vy);
+            }
+        }
+
         draw_scene(&fb, &state);
 
-        status = wait_key(SystemTable, &key);
+        status = uefi_call_wrapper(SystemTable->BootServices->Stall, 1, (UINTN)FRAME_US);
         if (EFI_ERROR(status)) {
             return status;
-        }
-
-        if (key.ScanCode == SCAN_ESC || key.UnicodeChar == 27) {
-            return EFI_SUCCESS;
-        }
-
-        if (key.ScanCode == SCAN_LEFT) {
-            state.rotation = (UINT8)((state.rotation + 3u) & 3u);
-            continue;
-        }
-
-        if (key.ScanCode == SCAN_RIGHT) {
-            state.rotation = (UINT8)((state.rotation + 1u) & 3u);
-            continue;
-        }
-
-        if (key.ScanCode == SCAN_UP || key.ScanCode == SCAN_DOWN) {
-            state.rotation = (UINT8)(state.rotation ^ 2u);
-            continue;
-        }
-
-        if (key.UnicodeChar == 'r' || key.UnicodeChar == 'R') {
-            state.rotation = ROT_NORMAL;
-            randomize_position(&state, &fb);
-            continue;
         }
     }
 
