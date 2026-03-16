@@ -35,8 +35,8 @@ typedef struct {
     UINT32 seed;
 } GameState;
 
-static const CHAR8 NAME1[] = {'R','A','N','D','A','L','L',0};
-static const CHAR8 NAME2[] = {'C','H','R','I','S',0};
+static const CHAR8 NAME1[] = "RANDALL";
+static const CHAR8 NAME2[] = "CHRIS";
 
 static const UINT8 GLYPH_A[8] = {0x3C, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00};
 static const UINT8 GLYPH_C[8] = {0x3C, 0x66, 0x60, 0x60, 0x60, 0x66, 0x3C, 0x00};
