@@ -1,43 +1,76 @@
+/*
+ * juego.c
+ * -------
+ * Implementación del juego que se ejecuta como aplicación UEFI.
+ *
+ * Contiene:
+ * - Definiciones de constantes de configuración y controles.
+ * - Estructuras para framebuffer y estado del juego.
+ * - Glyphs de 8x8 para dibujar caracteres simples en pantalla.
+ * - Funciones auxiliares para entrada, pantalla, y lógica del juego.
+ * - `game_run()` que es el punto de entrada llamado desde el bootloader.
+ *
+ * Diseñado para ejecutarse en un entorno freestanding UEFI usando GOP
+ * (Graphics Output Protocol) y las rutinas de entrada estándar UEFI.
+ */
+
 #include <efi.h>
 #include <efilib.h>
 
 #include "juego.h"
 
+/* Rotaciones posibles del texto/objeto en pantalla.
+ * ROT_NORMAL: orientación estándar (0 grados)
+ * ROT_LEFT:   rotación 90 grados a la izquierda
+ * ROT_180:    rotación 180 grados
+ * ROT_RIGHT:  rotación 90 grados a la derecha
+ */
 #define ROT_NORMAL 0
 #define ROT_LEFT   1
 #define ROT_180    2
 #define ROT_RIGHT  3
 
-#define SCALE 4
-#define CHAR_SIZE (8 * SCALE)
-#define CHAR_ADV  (9 * SCALE)
-#define MOVE_SPEED 4
-#define FRAME_US 16000
-#define HOLD_TIMEOUT_FRAMES 14
+/* Constantes de renderizado y temporización */
+#define SCALE 4                /* Escala multiplicadora para cada píxel del glyph */
+#define CHAR_SIZE (8 * SCALE)  /* Altura/anchura (en px) de un carácter escalado */
+#define CHAR_ADV  (9 * SCALE)  /* Espacio ocupado (advance) entre caracteres */
+#define MOVE_SPEED 6           /* Velocidad (px por frame) al mover */
+#define FRAME_US 16000         /* Microsegundos a esperar por frame (~62.5 FPS) */
+#define HOLD_TIMEOUT_FRAMES 24 /* Número de frames para considerar una tecla "mantener" */
 
+/* Identificadores para teclas de movimiento mantenidas por el jugador */
 #define MOVE_KEY_NONE  0
 #define MOVE_KEY_UP    1
 #define MOVE_KEY_DOWN  2
 #define MOVE_KEY_LEFT  3
 #define MOVE_KEY_RIGHT 4
 
+/* Representa la superficie de dibujo proporcionada por GOP. */
 typedef struct {
-    UINT32 width;
-    UINT32 height;
-    UINT32 ppsl;
-    UINT32 *fb;
+    UINT32 width;   /* Anchura en píxeles */
+    UINT32 height;  /* Altura en píxeles */
+    UINT32 ppsl;    /* Pixels per scan line (stride) del framebuffer */
+    UINT32 *fb;     /* Puntero al buffer de frame (FB con formato ARGB o similar) */
 } Framebuffer;
 
+/* Estado del juego: posición del objeto, rotación y semilla RNG */
 typedef struct {
-    INT32 x;
-    INT32 y;
-    UINT8 rotation;
-    UINT32 seed;
+    INT32 x;         /* Coordenada X superior-izquierda del objeto/render */
+    INT32 y;         /* Coordenada Y superior-izquierda del objeto/render */
+    UINT8 rotation;  /* Una de las ROT_* */
+    UINT32 seed;     /* Semilla para generador pseudoaleatorio (LCG) */
 } GameState;
 
+/* Textos que se mostrarán en pantalla: dos nombres */
 static const CHAR8 NAME1[] = "RANDALL";
 static const CHAR8 NAME2[] = "CHRIS";
 
+/*
+ * Glyphs de 8x8 para las letras usadas.
+ * Cada byte representa una fila de 8 bits; el bit más significativo
+ * corresponde al píxel más a la izquierda en la fila.
+ * Se usan para renderizar texto escalado y rotado manualmente.
+ */
 static const UINT8 GLYPH_A[8] = {0x3C, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00};
 static const UINT8 GLYPH_C[8] = {0x3C, 0x66, 0x60, 0x60, 0x60, 0x66, 0x3C, 0x00};
 static const UINT8 GLYPH_D[8] = {0x78, 0x6C, 0x66, 0x66, 0x66, 0x6C, 0x78, 0x00};
@@ -49,6 +82,9 @@ static const UINT8 GLYPH_R[8] = {0x7C, 0x66, 0x66, 0x7C, 0x6C, 0x66, 0x66, 0x00}
 static const UINT8 GLYPH_S[8] = {0x3C, 0x66, 0x60, 0x3C, 0x06, 0x66, 0x3C, 0x00};
 static const UINT8 GLYPH_SPACE[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 
+/* Devuelve un puntero al glyph correspondiente al carácter `ch`.
+ * Si no hay glyph definido, devuelve el glyph de espacio.
+ */
 static const UINT8 *glyph_for_char(CHAR8 ch) {
     switch (ch) {
         case 'A': return GLYPH_A;
@@ -65,6 +101,9 @@ static const UINT8 *glyph_for_char(CHAR8 ch) {
     }
 }
 
+/* Calcula la longitud de una cadena de `CHAR8` (ASCII), equivalente a strlen.
+ * Se usa strings cortas y predecibles; devuelve UINTN.
+ */
 static UINTN str_len8(const CHAR8 *s) {
     UINTN len = 0;
     while (s[len] != '\0') {
@@ -73,11 +112,19 @@ static UINTN str_len8(const CHAR8 *s) {
     return len;
 }
 
+/* EVENTO UEFI (teclado, no bloqueante):
+ * Intenta consumir una tecla pendiente con `ReadKeyStroke`.
+ * Si no hay tecla en cola, devuelve FALSE.
+ */
 static BOOLEAN poll_key(EFI_SYSTEM_TABLE *st, EFI_INPUT_KEY *key) {
     EFI_STATUS status = uefi_call_wrapper(st->ConIn->ReadKeyStroke, 2, st->ConIn, key);
     return (BOOLEAN)(!EFI_ERROR(status));
 }
 
+/* EVENTO UEFI (teclado, bloqueante):
+ * Espera señal en `ConIn->WaitForKey` usando `WaitForEvent`
+ * y luego obtiene la tecla con `ReadKeyStroke`.
+ */
 static EFI_STATUS wait_key(EFI_SYSTEM_TABLE *st, EFI_INPUT_KEY *key) {
     EFI_STATUS status;
     UINTN index;
@@ -91,18 +138,25 @@ static EFI_STATUS wait_key(EFI_SYSTEM_TABLE *st, EFI_INPUT_KEY *key) {
     return uefi_call_wrapper(st->ConIn->ReadKeyStroke, 2, st->ConIn, key);
 }
 
+/* Generador congruencial lineal simple (LCG) para pseudoaleatoriedad.
+ * Actualiza la semilla y devuelve el nuevo valor.
+ */
 static UINT32 lcg_next(UINT32 *seed) {
     *seed = (*seed * 1664525u) + 1013904223u;
     return *seed;
 }
 
+/* Muestra instrucciones y espera a que el usuario pulse ENTER para iniciar
+ * o ESC para cancelar. Devuelve EFI_SUCCESS si se aceptó, EFI_ABORTED si
+ * el usuario canceló y otro código de error si falló la lectura de teclado.
+ */
 static EFI_STATUS confirm_start(EFI_SYSTEM_TABLE *SystemTable) {
     EFI_INPUT_KEY key;
     EFI_STATUS status;
 
     uefi_call_wrapper(SystemTable->ConOut->ClearScreen, 1, SystemTable->ConOut);
     Print(L"=========================================\r\n");
-    Print(L" JUEGO: CHRIS Y RANDALL\r\n");
+    Print(L" JUEGO: CHRIS Y RANDALL Version UEFI/C\r\n");
     Print(L"=========================================\r\n\r\n");
     Print(L"Controles:\r\n");
     Print(L"  Flecha Izq  : Rotar 90 a la izquierda\r\n");
@@ -133,6 +187,9 @@ static EFI_STATUS confirm_start(EFI_SYSTEM_TABLE *SystemTable) {
     }
 }
 
+/* Inicializa la estructura Framebuffer a partir del GOP encontrado.
+ * Extrae resolución, stride y puntero al framebuffer físico.
+ */
 static void fb_init(Framebuffer *fb, EFI_GRAPHICS_OUTPUT_PROTOCOL *gop) {
     fb->width = gop->Mode->Info->HorizontalResolution;
     fb->height = gop->Mode->Info->VerticalResolution;
@@ -140,6 +197,9 @@ static void fb_init(Framebuffer *fb, EFI_GRAPHICS_OUTPUT_PROTOCOL *gop) {
     fb->fb = (UINT32 *)(UINTN)gop->Mode->FrameBufferBase;
 }
 
+/* Escribe un píxel en la posición (x,y) si está dentro de los límites.
+ * `color` se interpreta según el formato del framebuffer (habitualmente BGR/ARGB).
+ */
 static void put_pixel(const Framebuffer *fb, INT32 x, INT32 y, UINT32 color) {
     if (x < 0 || y < 0) {
         return;
@@ -152,6 +212,7 @@ static void put_pixel(const Framebuffer *fb, INT32 x, INT32 y, UINT32 color) {
     fb->fb[(UINTN)y * fb->ppsl + (UINTN)x] = color;
 }
 
+/* Rellena toda la pantalla con un color. Operación O(width*height). */
 static void fill_screen(const Framebuffer *fb, UINT32 color) {
     for (UINT32 y = 0; y < fb->height; ++y) {
         for (UINT32 x = 0; x < fb->width; ++x) {
@@ -160,6 +221,11 @@ static void fill_screen(const Framebuffer *fb, UINT32 color) {
     }
 }
 
+/* Dibuja un glyph 8x8 escalado y rotado en la posición base_x, base_y.
+ * - `glyph` es una tabla de 8 bytes (cada byte una fila).
+ * - `rotation` determina cómo rotar los bits antes de escalar.
+ * - Se aplica `SCALE` para dibujar un bloque por cada bit activo.
+ */
 static void draw_glyph_rotated(const Framebuffer *fb,
                                INT32 base_x,
                                INT32 base_y,
@@ -199,6 +265,10 @@ static void draw_glyph_rotated(const Framebuffer *fb,
     }
 }
 
+/* Dibuja una cadena `text` aplicada la rotación especificada.
+ * El texto puede dibujarse horizontalmente (ROT_NORMAL/ROT_180)
+ * o verticalmente (ROT_LEFT/ROT_RIGHT) usando `CHAR_ADV` como avance.
+ */
 static void draw_string_rotated(const Framebuffer *fb,
                                 INT32 x,
                                 INT32 y,
@@ -227,6 +297,9 @@ static void draw_string_rotated(const Framebuffer *fb,
     }
 }
 
+/* Calcula el rectángulo en píxeles ocupado por las dos cadenas (NAME1, NAME2)
+ * dependiendo de la rotación. Devuelve anchura y altura en `out_w/out_h`.
+ */
 static void calc_bounds(UINT8 rotation, UINTN len1, UINTN len2, INT32 *out_w, INT32 *out_h) {
     INT32 gap = CHAR_SIZE / 2;
     INT32 max_len = (len1 > len2) ? (INT32)len1 : (INT32)len2;
@@ -240,6 +313,10 @@ static void calc_bounds(UINT8 rotation, UINTN len1, UINTN len2, INT32 *out_w, IN
     }
 }
 
+/* Coloca el objeto en una posición pseudoaleatoria válida dentro de la pantalla
+ * utilizando la semilla del estado y asegurando que el objeto no salga
+ * fuera de los límites (se ajusta si la resolución es menor que el objeto).
+ */
 static void randomize_position(GameState *state, const Framebuffer *fb) {
     INT32 obj_w;
     INT32 obj_h;
@@ -262,6 +339,10 @@ static void randomize_position(GameState *state, const Framebuffer *fb) {
     state->y = (INT32)(lcg_next(&state->seed) % (UINT32)(max_y + 1));
 }
 
+/* Mueve el objeto según el vector (vx,vy) y rebota en los bordes.
+ * Si la nueva posición sale fuera, se clampa y se invierte el componente
+ * de velocidad correspondiente (efecto rebote).
+ */
 static void move_with_bounce(GameState *state, const Framebuffer *fb, INT32 *vx, INT32 *vy) {
     INT32 obj_w;
     INT32 obj_h;
@@ -305,13 +386,36 @@ static void move_with_bounce(GameState *state, const Framebuffer *fb, INT32 *vx,
     state->y = ny;
 }
 
-static void draw_scene(const Framebuffer *fb, const GameState *state) {
-    const UINT32 black = 0x00000000;
+/* Limpia (rellena de `color`) el rectángulo [x,x+w) x [y,y+h) con clipping.
+ * Usado para borrar la región anterior del objeto antes de redibujar.
+ */
+static void clear_rect(const Framebuffer *fb, INT32 x, INT32 y, INT32 w, INT32 h, UINT32 color) {
+    INT32 yy;
+    INT32 xx;
+    INT32 x0 = x;
+    INT32 y0 = y;
+    INT32 x1 = x + w;
+    INT32 y1 = y + h;
+
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > (INT32)fb->width) x1 = (INT32)fb->width;
+    if (y1 > (INT32)fb->height) y1 = (INT32)fb->height;
+
+    for (yy = y0; yy < y1; ++yy) {
+        for (xx = x0; xx < x1; ++xx) {
+            put_pixel(fb, xx, yy, color);
+        }
+    }
+}
+
+/* Dibuja únicamente los dos nombres (NAME1, NAME2) usando colores
+ * fijos (amarillo y magenta). La disposición depende de la rotación.
+ */
+static void draw_names_only(const Framebuffer *fb, const GameState *state) {
     const UINT32 yellow = 0x0000FFFF;
     const UINT32 magenta = 0x00FF00FF;
     INT32 gap = CHAR_SIZE / 2;
-
-    fill_screen(fb, black);
 
     if (state->rotation == ROT_NORMAL || state->rotation == ROT_180) {
         draw_string_rotated(fb, state->x, state->y, NAME1, state->rotation, yellow);
@@ -322,6 +426,14 @@ static void draw_scene(const Framebuffer *fb, const GameState *state) {
     }
 }
 
+/* Construye una semilla pseudoaleatoria mezclando:
+ * - dimensiones de pantalla
+ * - tiempo (si está disponible vía RuntimeServices->GetTime)
+ * - la dirección del framebuffer
+ *
+ * Se aplica una mezcla adicional tipo xorshift para mejorar distribución.
+ * Si el resultado es 0, se fuerza a 1 (evitar semilla cero en LCG).
+ */
 static UINT32 make_seed(EFI_SYSTEM_TABLE *SystemTable, const Framebuffer *fb) {
     UINT32 seed = 0xA5A5A5A5u ^ fb->width ^ (fb->height << 16);
     EFI_TIME now;
@@ -356,6 +468,10 @@ EFI_STATUS game_run(EFI_SYSTEM_TABLE *SystemTable) {
     EFI_INPUT_KEY key;
     EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = NULL;
     EFI_GUID gop_guid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
+    EFI_EVENT events[2];
+    UINTN event_index = 0;
+    BOOLEAN timer_created = FALSE;
+    const UINT64 frame_tick_100ns = (UINT64)FRAME_US * 10ULL;
     Framebuffer fb;
     GameState state;
     UINT32 frame = 0;
@@ -363,6 +479,9 @@ EFI_STATUS game_run(EFI_SYSTEM_TABLE *SystemTable) {
     UINT8 active_move_key = MOVE_KEY_NONE;
     INT32 vx = 0;
     INT32 vy = 0;
+    INT32 prev_x = 0;
+    INT32 prev_y = 0;
+    UINT8 prev_rotation = 0xFF;
 
     status = confirm_start(SystemTable);
     if (status == EFI_ABORTED) {
@@ -387,76 +506,124 @@ EFI_STATUS game_run(EFI_SYSTEM_TABLE *SystemTable) {
     state.seed = make_seed(SystemTable, &fb);
     randomize_position(&state, &fb);
 
+    /* Limpiamos una sola vez y luego usamos redibujado parcial para mejorar FPS. */
+    fill_screen(&fb, 0x00000000);
+
+    prev_x = state.x;
+    prev_y = state.y;
+
+    /* INTERRUPCIONES/EVENTOS (UEFI):
+     * - `events[0]` apunta al evento de teclado proporcionado por `ConIn->WaitForKey`.
+     * - `events[1]` se crea como un evento timer periódico mediante
+     *     CreateEvent(EVT_TIMER) + SetTimer(TimerPeriodic).
+     * - Ambos eventos se esperan con `WaitForEvent(2, events, &event_index)`.
+     *
+     * Nota: en UEFI no hay `int 0x10/0x16` — el firmware provee eventos/timers
+     * que son el equivalente para manejar entrada y temporización.
+     */
+    events[0] = SystemTable->ConIn->WaitForKey;
+    events[1] = NULL;
+
+    status = uefi_call_wrapper(SystemTable->BootServices->CreateEvent, 5,
+                               EVT_TIMER, TPL_CALLBACK, NULL, NULL, &events[1]);
+    if (EFI_ERROR(status)) {
+        return status;
+    }
+    timer_created = TRUE;
+
+    status = uefi_call_wrapper(SystemTable->BootServices->SetTimer, 3,
+                               events[1], TimerPeriodic, frame_tick_100ns);
+    if (EFI_ERROR(status)) {
+        goto cleanup;
+    }
+
     while (1) {
-        ++frame;
+        BOOLEAN needs_redraw = FALSE;
 
-        while (poll_key(SystemTable, &key)) {
-            if (key.ScanCode == SCAN_ESC || key.UnicodeChar == 27) {
-                return EFI_SUCCESS;
-            }
-
-            if (key.ScanCode == SCAN_LEFT) {
-                state.rotation = (UINT8)((state.rotation + 3u) & 3u);
-                continue;
-            }
-
-            if (key.ScanCode == SCAN_RIGHT) {
-                state.rotation = (UINT8)((state.rotation + 1u) & 3u);
-                continue;
-            }
-
-            if (key.ScanCode == SCAN_UP || key.ScanCode == SCAN_DOWN) {
-                state.rotation = (UINT8)(state.rotation ^ 2u);
-                continue;
-            }
-
-            if (key.UnicodeChar == 'r' || key.UnicodeChar == 'R') {
-                state.rotation = ROT_NORMAL;
-                state.seed = make_seed(SystemTable, &fb);
-                randomize_position(&state, &fb);
-                continue;
-            }
-
-            if (key.UnicodeChar == 'w' || key.UnicodeChar == 'W') {
-                if (!(active_move_key == MOVE_KEY_UP && (frame - last_move_input_frame) <= HOLD_TIMEOUT_FRAMES)) {
-                    active_move_key = MOVE_KEY_UP;
-                    vx = 0;
-                    vy = -MOVE_SPEED;
-                }
-                last_move_input_frame = frame;
-                continue;
-            }
-
-            if (key.UnicodeChar == 's' || key.UnicodeChar == 'S') {
-                if (!(active_move_key == MOVE_KEY_DOWN && (frame - last_move_input_frame) <= HOLD_TIMEOUT_FRAMES)) {
-                    active_move_key = MOVE_KEY_DOWN;
-                    vx = 0;
-                    vy = MOVE_SPEED;
-                }
-                last_move_input_frame = frame;
-                continue;
-            }
-
-            if (key.UnicodeChar == 'a' || key.UnicodeChar == 'A') {
-                if (!(active_move_key == MOVE_KEY_LEFT && (frame - last_move_input_frame) <= HOLD_TIMEOUT_FRAMES)) {
-                    active_move_key = MOVE_KEY_LEFT;
-                    vx = -MOVE_SPEED;
-                    vy = 0;
-                }
-                last_move_input_frame = frame;
-                continue;
-            }
-
-            if (key.UnicodeChar == 'd' || key.UnicodeChar == 'D') {
-                if (!(active_move_key == MOVE_KEY_RIGHT && (frame - last_move_input_frame) <= HOLD_TIMEOUT_FRAMES)) {
-                    active_move_key = MOVE_KEY_RIGHT;
-                    vx = MOVE_SPEED;
-                    vy = 0;
-                }
-                last_move_input_frame = frame;
-                continue;
-            }
+        /* EVENTO UEFI central: el bucle duerme hasta que llegue teclado
+         * o el tick periódico del timer de frame.
+         */
+        status = uefi_call_wrapper(SystemTable->BootServices->WaitForEvent, 3,
+                                   2, events, &event_index);
+        if (EFI_ERROR(status)) {
+            goto cleanup;
         }
+
+        if (event_index == 0) {
+            /* Si despertó por teclado, vaciamos cola de teclas pendientes. */
+            while (poll_key(SystemTable, &key)) {
+                if (key.ScanCode == SCAN_ESC || key.UnicodeChar == 27) {
+                    status = EFI_SUCCESS;
+                    goto cleanup;
+                }
+
+                if (key.ScanCode == SCAN_LEFT) {
+                    state.rotation = (UINT8)((state.rotation + 3u) & 3u);
+                    continue;
+                }
+
+                if (key.ScanCode == SCAN_RIGHT) {
+                    state.rotation = (UINT8)((state.rotation + 1u) & 3u);
+                    continue;
+                }
+
+                if (key.ScanCode == SCAN_UP || key.ScanCode == SCAN_DOWN) {
+                    state.rotation = (UINT8)(state.rotation ^ 2u);
+                    continue;
+                }
+
+                if (key.UnicodeChar == 'r' || key.UnicodeChar == 'R') {
+                    state.rotation = ROT_NORMAL;
+                    state.seed = make_seed(SystemTable, &fb);
+                    randomize_position(&state, &fb);
+                    continue;
+                }
+
+                if (key.UnicodeChar == 'w' || key.UnicodeChar == 'W') {
+                    if (!(active_move_key == MOVE_KEY_UP && (frame - last_move_input_frame) <= HOLD_TIMEOUT_FRAMES)) {
+                        active_move_key = MOVE_KEY_UP;
+                        vx = 0;
+                        vy = -MOVE_SPEED;
+                    }
+                    last_move_input_frame = frame;
+                    continue;
+                }
+
+                if (key.UnicodeChar == 's' || key.UnicodeChar == 'S') {
+                    if (!(active_move_key == MOVE_KEY_DOWN && (frame - last_move_input_frame) <= HOLD_TIMEOUT_FRAMES)) {
+                        active_move_key = MOVE_KEY_DOWN;
+                        vx = 0;
+                        vy = MOVE_SPEED;
+                    }
+                    last_move_input_frame = frame;
+                    continue;
+                }
+
+                if (key.UnicodeChar == 'a' || key.UnicodeChar == 'A') {
+                    if (!(active_move_key == MOVE_KEY_LEFT && (frame - last_move_input_frame) <= HOLD_TIMEOUT_FRAMES)) {
+                        active_move_key = MOVE_KEY_LEFT;
+                        vx = -MOVE_SPEED;
+                        vy = 0;
+                    }
+                    last_move_input_frame = frame;
+                    continue;
+                }
+
+                if (key.UnicodeChar == 'd' || key.UnicodeChar == 'D') {
+                    if (!(active_move_key == MOVE_KEY_RIGHT && (frame - last_move_input_frame) <= HOLD_TIMEOUT_FRAMES)) {
+                        active_move_key = MOVE_KEY_RIGHT;
+                        vx = MOVE_SPEED;
+                        vy = 0;
+                    }
+                    last_move_input_frame = frame;
+                    continue;
+                }
+            }
+            continue;
+        }
+
+        /* Si despertó por timer, avanzamos un frame de simulación/render. */
+        ++frame;
 
         if (active_move_key != MOVE_KEY_NONE) {
             if ((frame - last_move_input_frame) > HOLD_TIMEOUT_FRAMES) {
@@ -468,13 +635,29 @@ EFI_STATUS game_run(EFI_SYSTEM_TABLE *SystemTable) {
             }
         }
 
-        draw_scene(&fb, &state);
-
-        status = uefi_call_wrapper(SystemTable->BootServices->Stall, 1, (UINTN)FRAME_US);
-        if (EFI_ERROR(status)) {
-            return status;
+        if (state.x != prev_x || state.y != prev_y || state.rotation != prev_rotation) {
+            needs_redraw = TRUE;
         }
+
+        if (needs_redraw) {
+            if (prev_rotation != 0xFF) {
+                INT32 old_w;
+                INT32 old_h;
+                calc_bounds(prev_rotation, str_len8(NAME1), str_len8(NAME2), &old_w, &old_h);
+                clear_rect(&fb, prev_x, prev_y, old_w, old_h, 0);
+            }
+
+            draw_names_only(&fb, &state);
+            prev_x = state.x;
+            prev_y = state.y;
+            prev_rotation = state.rotation;
+        }
+
     }
 
-    return EFI_SUCCESS;
+cleanup:
+    if (timer_created) {
+        uefi_call_wrapper(SystemTable->BootServices->CloseEvent, 1, events[1]);
+    }
+    return status;
 }

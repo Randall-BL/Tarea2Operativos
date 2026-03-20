@@ -1,3 +1,16 @@
+/* juego.c (UEFI ARM64)
+ * ------------------------------------------------------------
+ * Versión del juego para entorno UEFI AArch64 (sin BIOS legacy).
+ *
+ * Aquí NO existen interrupciones BIOS tipo `INT 0x10/0x16`.
+ * El equivalente en UEFI es el modelo de eventos del firmware:
+ * - Evento de teclado: `ConIn->WaitForKey` + `ReadKeyStroke`
+ * - Evento de timer: `CreateEvent(EVT_TIMER)` + `SetTimer(TimerPeriodic)`
+ * - Multiplexado: `WaitForEvent(...)`
+ *
+ * Busca comentarios con "EVENTO UEFI" en funciones clave.
+ */
+
 #include "efi_min.h"
 
 #define ROT_NORMAL 0
@@ -14,9 +27,9 @@
 #define SCALE 4
 #define CHAR_SIZE (8 * SCALE)
 #define CHAR_ADV  (9 * SCALE)
-#define MOVE_SPEED 4
+#define MOVE_SPEED 6
 #define FRAME_US 16000
-#define HOLD_TIMEOUT_FRAMES 14
+#define HOLD_TIMEOUT_FRAMES 24
 
 #define COL_BG 0
 #define COL_T1 11
@@ -41,17 +54,20 @@ static const CHAR8 NAME1[] = {'R','A','N','D','A','L','L',0};
 static const CHAR8 NAME2[] = {'C','H','R','I','S',0};
 
 static CHAR16 MSG_TITLE1[] = L"=========================================\r\n";
-static CHAR16 MSG_TITLE2[] = L" JUEGO: CHRIS Y RANDALL\r\n";
+static CHAR16 MSG_TITLE2[] = L" JUEGO: CHRIS Y RANDALL VersionARM\r\n";
 static CHAR16 MSG_TITLE3[] = L"=========================================\r\n\r\n";
 static CHAR16 MSG_C1[] = L"Controles:\r\n";
 static CHAR16 MSG_C2[] = L"  Flecha Izq  : Rotar 90 a la izquierda\r\n";
 static CHAR16 MSG_C3[] = L"  Flecha Der  : Rotar 90 a la derecha\r\n";
 static CHAR16 MSG_C4[] = L"  Flecha Arr  : Rotar 180\r\n";
 static CHAR16 MSG_C5[] = L"  Flecha Abj  : Rotar 180\r\n";
-static CHAR16 MSG_C6[] = L"  W/S/A/D     : Mover con rebote\r\n";
-static CHAR16 MSG_C7[] = L"  R           : Reiniciar posicion random\r\n";
-static CHAR16 MSG_C8[] = L"  ESC         : Salir del juego\r\n\r\n";
-static CHAR16 MSG_C9[] = L"ENTER para comenzar o ESC para cancelar...\r\n";
+static CHAR16 MSG_C6[] = L"  W           : Mover arriba\r\n";
+static CHAR16 MSG_C7[] = L"  S           : Mover abajo\r\n";
+static CHAR16 MSG_C8[] = L"  A           : Mover izquierda\r\n";
+static CHAR16 MSG_C9[] = L"  D           : Mover derecha\r\n";
+static CHAR16 MSG_C10[] = L"  R           : Reiniciar posicion random\r\n";
+static CHAR16 MSG_C11[] = L"  ESC         : Salir del juego\r\n\r\n";
+static CHAR16 MSG_C12[] = L"ENTER para comenzar o ESC para cancelar...\r\n";
 static CHAR16 MSG_GOP[] = L"No se pudo iniciar GOP. Presiona una tecla...\r\n";
 
 static const UINT8 GLYPH_A[8] = {0x3C, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00};
@@ -65,14 +81,20 @@ static const UINT8 GLYPH_R[8] = {0x7C, 0x66, 0x66, 0x7C, 0x6C, 0x66, 0x66, 0x00}
 static const UINT8 GLYPH_S[8] = {0x3C, 0x66, 0x60, 0x3C, 0x06, 0x66, 0x3C, 0x00};
 static const UINT8 GLYPH_SPACE[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 
+/* Borra pantalla de texto usando servicio de consola UEFI. */
 static void text_clear(EFI_SYSTEM_TABLE *st) {
     st->ConOut->ClearScreen(st->ConOut);
 }
 
+/* Imprime cadena UTF-16 en consola UEFI. */
 static void text_print(EFI_SYSTEM_TABLE *st, CHAR16 *msg) {
     st->ConOut->OutputString(st->ConOut, msg);
 }
 
+/* EVENTO UEFI (teclado): espera bloqueante.
+ * - Espera señal de `ConIn->WaitForKey` con `WaitForEvent`
+ * - Luego consume la tecla con `ReadKeyStroke`
+ */
 static EFI_STATUS wait_key(EFI_SYSTEM_TABLE *st, EFI_INPUT_KEY *key) {
     EFI_STATUS status;
     EFI_EVENT ev;
@@ -86,6 +108,9 @@ static EFI_STATUS wait_key(EFI_SYSTEM_TABLE *st, EFI_INPUT_KEY *key) {
     return st->ConIn->ReadKeyStroke(st->ConIn, key);
 }
 
+/* EVENTO UEFI (teclado): lectura no bloqueante.
+ * Si no hay tecla, `ReadKeyStroke` devuelve error/not-ready.
+ */
 static BOOLEAN poll_key(EFI_SYSTEM_TABLE *st, EFI_INPUT_KEY *key) {
     EFI_STATUS status = st->ConIn->ReadKeyStroke(st->ConIn, key);
     return (BOOLEAN)(status == EFI_SUCCESS);
@@ -132,6 +157,9 @@ static EFI_STATUS confirm_start(EFI_SYSTEM_TABLE *st) {
     text_print(st, MSG_C7);
     text_print(st, MSG_C8);
     text_print(st, MSG_C9);
+    text_print(st, MSG_C10);
+    text_print(st, MSG_C11);
+    text_print(st, MSG_C12);
 
     for (;;) {
         status = wait_key(st, &key);
@@ -377,10 +405,28 @@ static void move_with_bounce(GameState *state, const Framebuffer *fb, INT32 *vx,
     state->y = ny;
 }
 
-static void draw_scene(const Framebuffer *fb, const GameState *state) {
-    INT32 gap = CHAR_SIZE / 2;
+static void clear_rect(const Framebuffer *fb, INT32 x, INT32 y, INT32 w, INT32 h, UINT32 color_idx) {
+    INT32 yy;
+    INT32 xx;
+    INT32 x0 = x;
+    INT32 y0 = y;
+    INT32 x1 = x + w;
+    INT32 y1 = y + h;
 
-    fill_screen(fb, COL_BG);
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > (INT32)fb->width) x1 = (INT32)fb->width;
+    if (y1 > (INT32)fb->height) y1 = (INT32)fb->height;
+
+    for (yy = y0; yy < y1; ++yy) {
+        for (xx = x0; xx < x1; ++xx) {
+            put_pixel(fb, xx, yy, color_idx);
+        }
+    }
+}
+
+static void draw_names_only(const Framebuffer *fb, const GameState *state) {
+    INT32 gap = CHAR_SIZE / 2;
 
     if (state->rotation == ROT_NORMAL || state->rotation == ROT_180) {
         draw_string_rotated(fb, state->x, state->y, NAME1, state->rotation, 1);
@@ -396,11 +442,18 @@ EFI_STATUS efi_main_c(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     GameState state;
     EFI_INPUT_KEY key;
     EFI_STATUS status;
+    EFI_EVENT events[2];
+    UINTN event_index = 0;
+    BOOLEAN timer_created = 0;
+    UINT64 frame_tick_100ns = (UINT64)FRAME_US * 10ULL;
     UINT32 frame = 0;
     UINT32 last_move_input_frame = 0;
     UINT8 active_move_key = MOVE_KEY_NONE;
     INT32 vx = 0;
     INT32 vy = 0;
+    INT32 prev_x = 0;
+    INT32 prev_y = 0;
+    UINT8 prev_rotation = 0xFF;
     (void)image;
 
     status = confirm_start(st);
@@ -423,69 +476,113 @@ EFI_STATUS efi_main_c(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     state.seed = make_seed(st, &fb);
     randomize_position(&state, &fb);
 
+    fill_screen(&fb, COL_BG);
+    prev_x = state.x;
+    prev_y = state.y;
+
+    /* INTERRUPCIONES/EVENTOS (UEFI AArch64):
+     * - `events[0]` es el evento de teclado: `ConIn->WaitForKey`.
+     * - `events[1]` se crea como un evento timer periódico (CreateEvent + SetTimer).
+     * - El bucle principal espera ambos con `WaitForEvent(2, events, &event_index)`;
+     *   cuando `event_index==0` se procesan teclas, cuando `==1` avanza el frame.
+     *
+     * Esto reemplaza el polling + Stall y equivale a usar "interrupciones"
+     * proporcionadas por el firmware UEFI.
+     */
+    events[0] = st->ConIn->WaitForKey;
+    events[1] = (EFI_EVENT)0;
+
+    status = st->BootServices->CreateEvent(EVT_TIMER, TPL_CALLBACK, (EFI_EVENT_NOTIFY)0, 0, &events[1]);
+    if (EFI_ERROR(status)) {
+        return status;
+    }
+    timer_created = 1;
+
+    status = st->BootServices->SetTimer(events[1], TimerPeriodic, frame_tick_100ns);
+    if (EFI_ERROR(status)) {
+        goto cleanup;
+    }
+
     for (;;) {
-        ++frame;
+        BOOLEAN needs_redraw = 0;
 
-        while (poll_key(st, &key)) {
-            if (key.ScanCode == SCAN_ESC || key.UnicodeChar == 27) {
-                return EFI_SUCCESS;
-            }
-
-            if (key.ScanCode == SCAN_LEFT) {
-                state.rotation = (UINT8)((state.rotation + 3u) & 3u);
-                continue;
-            }
-            if (key.ScanCode == SCAN_RIGHT) {
-                state.rotation = (UINT8)((state.rotation + 1u) & 3u);
-                continue;
-            }
-            if (key.ScanCode == SCAN_UP || key.ScanCode == SCAN_DOWN) {
-                state.rotation = (UINT8)(state.rotation ^ 2u);
-                continue;
-            }
-            if (key.UnicodeChar == 'r' || key.UnicodeChar == 'R') {
-                state.rotation = ROT_NORMAL;
-                state.seed = make_seed(st, &fb);
-                randomize_position(&state, &fb);
-                continue;
-            }
-            if (key.UnicodeChar == 'w' || key.UnicodeChar == 'W') {
-                if (!(active_move_key == MOVE_KEY_UP && (frame - last_move_input_frame) <= HOLD_TIMEOUT_FRAMES)) {
-                    active_move_key = MOVE_KEY_UP;
-                    vx = 0;
-                    vy = -MOVE_SPEED;
-                }
-                last_move_input_frame = frame;
-                continue;
-            }
-            if (key.UnicodeChar == 's' || key.UnicodeChar == 'S') {
-                if (!(active_move_key == MOVE_KEY_DOWN && (frame - last_move_input_frame) <= HOLD_TIMEOUT_FRAMES)) {
-                    active_move_key = MOVE_KEY_DOWN;
-                    vx = 0;
-                    vy = MOVE_SPEED;
-                }
-                last_move_input_frame = frame;
-                continue;
-            }
-            if (key.UnicodeChar == 'a' || key.UnicodeChar == 'A') {
-                if (!(active_move_key == MOVE_KEY_LEFT && (frame - last_move_input_frame) <= HOLD_TIMEOUT_FRAMES)) {
-                    active_move_key = MOVE_KEY_LEFT;
-                    vx = -MOVE_SPEED;
-                    vy = 0;
-                }
-                last_move_input_frame = frame;
-                continue;
-            }
-            if (key.UnicodeChar == 'd' || key.UnicodeChar == 'D') {
-                if (!(active_move_key == MOVE_KEY_RIGHT && (frame - last_move_input_frame) <= HOLD_TIMEOUT_FRAMES)) {
-                    active_move_key = MOVE_KEY_RIGHT;
-                    vx = MOVE_SPEED;
-                    vy = 0;
-                }
-                last_move_input_frame = frame;
-                continue;
-            }
+        /* EVENTO UEFI: aquí el firmware despierta cuando ocurre teclado o tick.
+         * event_index == 0 => entrada de teclado
+         * event_index == 1 => tick del timer de frame
+         */
+        status = st->BootServices->WaitForEvent(2, events, &event_index);
+        if (EFI_ERROR(status)) {
+            goto cleanup;
         }
+
+        if (event_index == 0) {
+            /* Consumimos todas las teclas pendientes para reducir latencia de input. */
+            while (poll_key(st, &key)) {
+                if (key.ScanCode == SCAN_ESC || key.UnicodeChar == 27) {
+                    status = EFI_SUCCESS;
+                    goto cleanup;
+                }
+
+                if (key.ScanCode == SCAN_LEFT) {
+                    state.rotation = (UINT8)((state.rotation + 3u) & 3u);
+                    continue;
+                }
+                if (key.ScanCode == SCAN_RIGHT) {
+                    state.rotation = (UINT8)((state.rotation + 1u) & 3u);
+                    continue;
+                }
+                if (key.ScanCode == SCAN_UP || key.ScanCode == SCAN_DOWN) {
+                    state.rotation = (UINT8)(state.rotation ^ 2u);
+                    continue;
+                }
+                if (key.UnicodeChar == 'r' || key.UnicodeChar == 'R') {
+                    state.rotation = ROT_NORMAL;
+                    state.seed = make_seed(st, &fb);
+                    randomize_position(&state, &fb);
+                    continue;
+                }
+                if (key.UnicodeChar == 'w' || key.UnicodeChar == 'W') {
+                    if (!(active_move_key == MOVE_KEY_UP && (frame - last_move_input_frame) <= HOLD_TIMEOUT_FRAMES)) {
+                        active_move_key = MOVE_KEY_UP;
+                        vx = 0;
+                        vy = -MOVE_SPEED;
+                    }
+                    last_move_input_frame = frame;
+                    continue;
+                }
+                if (key.UnicodeChar == 's' || key.UnicodeChar == 'S') {
+                    if (!(active_move_key == MOVE_KEY_DOWN && (frame - last_move_input_frame) <= HOLD_TIMEOUT_FRAMES)) {
+                        active_move_key = MOVE_KEY_DOWN;
+                        vx = 0;
+                        vy = MOVE_SPEED;
+                    }
+                    last_move_input_frame = frame;
+                    continue;
+                }
+                if (key.UnicodeChar == 'a' || key.UnicodeChar == 'A') {
+                    if (!(active_move_key == MOVE_KEY_LEFT && (frame - last_move_input_frame) <= HOLD_TIMEOUT_FRAMES)) {
+                        active_move_key = MOVE_KEY_LEFT;
+                        vx = -MOVE_SPEED;
+                        vy = 0;
+                    }
+                    last_move_input_frame = frame;
+                    continue;
+                }
+                if (key.UnicodeChar == 'd' || key.UnicodeChar == 'D') {
+                    if (!(active_move_key == MOVE_KEY_RIGHT && (frame - last_move_input_frame) <= HOLD_TIMEOUT_FRAMES)) {
+                        active_move_key = MOVE_KEY_RIGHT;
+                        vx = MOVE_SPEED;
+                        vy = 0;
+                    }
+                    last_move_input_frame = frame;
+                    continue;
+                }
+            }
+            continue;
+        }
+
+        /* Tick de frame: actualiza física y dibujado */
+        ++frame;
 
         if (active_move_key != MOVE_KEY_NONE) {
             if ((frame - last_move_input_frame) > HOLD_TIMEOUT_FRAMES) {
@@ -497,7 +594,28 @@ EFI_STATUS efi_main_c(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
             }
         }
 
-        draw_scene(&fb, &state);
-        st->BootServices->Stall((UINTN)FRAME_US);
+        if (state.x != prev_x || state.y != prev_y || state.rotation != prev_rotation) {
+            needs_redraw = 1;
+        }
+
+        if (needs_redraw) {
+            if (prev_rotation != 0xFF) {
+                INT32 old_w;
+                INT32 old_h;
+                calc_bounds(prev_rotation, str_len8(NAME1), str_len8(NAME2), &old_w, &old_h);
+                clear_rect(&fb, prev_x, prev_y, old_w, old_h, COL_BG);
+            }
+
+            draw_names_only(&fb, &state);
+            prev_x = state.x;
+            prev_y = state.y;
+            prev_rotation = state.rotation;
+        }
     }
+
+cleanup:
+    if (timer_created) {
+        st->BootServices->CloseEvent(events[1]);
+    }
+    return status;
 }

@@ -2,7 +2,7 @@
 set -e
 
 # ============================================================
-# build_c.sh - ARM64 UEFI (boot.S + juego.c)
+# build_c.sh - ARM64 UEFI (entrada directa en C)
 #
 # Nota: en ARM no existe BIOS legacy x86, así que esta versión
 # genera una aplicación UEFI AArch64: /EFI/BOOT/BOOTAA64.EFI
@@ -63,14 +63,13 @@ rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 
 echo "[1/4] Compilando ARM64 UEFI ..."
-$CC $TARGET_FLAG -ffreestanding -fshort-wchar -fno-stack-protector -fno-pic -nostdlib -O2 -Wall -Wextra -c "$SCRIPT_DIR/boot.S" -o "$BUILD_DIR/boot.o"
 $CC $TARGET_FLAG -ffreestanding -fshort-wchar -fno-stack-protector -fno-pic -nostdlib -O2 -Wall -Wextra -c "$SCRIPT_DIR/juego.c" -o "$BUILD_DIR/juego.o"
 
 if [ "$LINK_MODE" = "lld-link" ]; then
-  $LD /nodefaultlib /entry:_start /subsystem:efi_application /machine:arm64 \
-      /out:"$EFI_FILE" "$BUILD_DIR/boot.o" "$BUILD_DIR/juego.o"
+  $LD /nodefaultlib /entry:efi_main_c /subsystem:efi_application /machine:arm64 \
+      /out:"$EFI_FILE" "$BUILD_DIR/juego.o"
 else
-  $LD -nostdlib -T "$SCRIPT_DIR/linker.ld" "$BUILD_DIR/boot.o" "$BUILD_DIR/juego.o" -o "$ELF_FILE"
+  $LD -nostdlib -T "$SCRIPT_DIR/linker.ld" "$BUILD_DIR/juego.o" -o "$ELF_FILE"
   $OBJCOPY -O efi-app-aarch64 "$ELF_FILE" "$EFI_FILE"
 fi
 
