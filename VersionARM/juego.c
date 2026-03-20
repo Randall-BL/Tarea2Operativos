@@ -2,13 +2,10 @@
  * ------------------------------------------------------------
  * Versión del juego para entorno UEFI AArch64 (sin BIOS legacy).
  *
- * Aquí NO existen interrupciones BIOS tipo `INT 0x10/0x16`.
- * El equivalente en UEFI es el modelo de eventos del firmware:
  * - Evento de teclado: `ConIn->WaitForKey` + `ReadKeyStroke`
  * - Evento de timer: `CreateEvent(EVT_TIMER)` + `SetTimer(TimerPeriodic)`
  * - Multiplexado: `WaitForEvent(...)`
  *
- * Busca comentarios con "EVENTO UEFI" en funciones clave.
  */
 
 #include "efi_min.h"
