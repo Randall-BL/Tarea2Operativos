@@ -3,15 +3,9 @@
  * ============================================================
  *
  * Propósito:
- *   Bootloader UEFI moderno que reemplaza el BIOS legacy.
  *   Se carga como BOOTX64.EFI desde /EFI/BOOT/ del medio FAT32.
  *   Proporciona menú de inicio y punto de entrada al juego.
  *
- * Limitaciones vs. BIOS Legacy:
- *   - Sin interrupciones x86 (INT 0x10, 0x16, etc.)
- *   - En cambio, usa servicios de firmware UEFI
- *   - No acceso directo a VRAM (usar Graphics Output Protocol)
- *   - Ejecución en modo x64 (64-bit), no 16-bit real mode
  *
  * Flujo principal:
  *   1. efi_main(): punto de entrada UEFI
